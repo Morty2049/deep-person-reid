@@ -17,13 +17,11 @@ import data_manager
 from dataset_loader import ImageDataset
 import transforms as T
 import models
-from losses import CrossEntropyLabelSmooth, TripletLoss, DeepSupervision
+from losses import CrossEntropyLabelSmooth, CenterLoss
 from utils import AverageMeter, Logger, save_checkpoint
 from eval_metrics import evaluate
-from samplers import RandomIdentitySampler
-from optimizers import init_optim
 
-parser = argparse.ArgumentParser(description='Train image model with cross entropy loss and hard triplet loss')
+parser = argparse.ArgumentParser(description='Train image model with center loss')
 # Datasets
 parser.add_argument('--root', type=str, default='data', help="root path to data directory")
 parser.add_argument('-d', '--dataset', type=str, default='market1501',
@@ -43,8 +41,7 @@ parser.add_argument('--cuhk03-classic-split', action='store_true',
 parser.add_argument('--use-metric-cuhk03', action='store_true',
                     help="whether to use cuhk03-metric (default: False)")
 # Optimization options
-parser.add_argument('--optim', type=str, default='adam', help="optimization algorithm (see optimizers.py)")
-parser.add_argument('--max-epoch', default=180, type=int,
+parser.add_argument('--max-epoch', default=60, type=int,
                     help="maximum epochs to run")
 parser.add_argument('--start-epoch', default=0, type=int,
                     help="manual epoch number (useful on restarts)")
@@ -53,17 +50,15 @@ parser.add_argument('--train-batch', default=32, type=int,
 parser.add_argument('--test-batch', default=32, type=int, help="test batch size")
 parser.add_argument('--lr', '--learning-rate', default=0.0003, type=float,
                     help="initial learning rate")
-parser.add_argument('--stepsize', default=60, type=int,
+parser.add_argument('--lr-cent', default=0.5, type=float,
+                    help="learning rate for center loss")
+parser.add_argument('--weight-cent', type=float, default=0.0005, help="weight for center loss")
+parser.add_argument('--stepsize', default=20, type=int,
                     help="stepsize to decay learning rate (>0 means this is enabled)")
 parser.add_argument('--gamma', default=0.1, type=float,
                     help="learning rate decay")
 parser.add_argument('--weight-decay', default=5e-04, type=float,
                     help="weight decay (default: 5e-04)")
-parser.add_argument('--margin', type=float, default=0.3, help="margin for triplet loss")
-parser.add_argument('--num-instances', type=int, default=4,
-                    help="number of instances per identity")
-parser.add_argument('--htri-only', action='store_true', default=False,
-                    help="if this is True, only htri loss is used in training")
 # Architecture
 parser.add_argument('-a', '--arch', type=str, default='resnet50', choices=models.get_names())
 # Miscs
@@ -121,8 +116,7 @@ def main():
 
     trainloader = DataLoader(
         ImageDataset(dataset.train, transform=transform_train),
-        sampler=RandomIdentitySampler(dataset.train, num_instances=args.num_instances),
-        batch_size=args.train_batch, num_workers=args.workers,
+        batch_size=args.train_batch, shuffle=True, num_workers=args.workers,
         pin_memory=pin_memory, drop_last=True,
     )
 
@@ -139,15 +133,17 @@ def main():
     )
 
     print("Initializing model: {}".format(args.arch))
-    model = models.init_model(name=args.arch, num_classes=dataset.num_train_pids, loss={'xent', 'htri'})
+    model = models.init_model(name=args.arch, num_classes=dataset.num_train_pids, loss={'cent'})
     print("Model size: {:.5f}M".format(sum(p.numel() for p in model.parameters())/1000000.0))
 
     criterion_xent = CrossEntropyLabelSmooth(num_classes=dataset.num_train_pids, use_gpu=use_gpu)
-    criterion_htri = TripletLoss(margin=args.margin)
+    criterion_cent = CenterLoss(num_classes=dataset.num_train_pids, feat_dim=model.feat_dim, use_gpu=use_gpu)
+
+    optimizer_model = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer_cent = torch.optim.SGD(criterion_cent.parameters(), lr=args.lr_cent)
     
-    optimizer = init_optim(args.optim, model.parameters(), args.lr, args.weight_decay)
     if args.stepsize > 0:
-        scheduler = lr_scheduler.StepLR(optimizer, step_size=args.stepsize, gamma=args.gamma)
+        scheduler = lr_scheduler.StepLR(optimizer_model, step_size=args.stepsize, gamma=args.gamma)
     start_epoch = args.start_epoch
 
     if args.resume:
@@ -172,7 +168,7 @@ def main():
 
     for epoch in range(start_epoch, args.max_epoch):
         start_train_time = time.time()
-        train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, use_gpu)
+        train(epoch, model, criterion_xent, criterion_cent, optimizer_model, optimizer_cent, trainloader, use_gpu)
         train_time += round(time.time() - start_train_time)
         
         if args.stepsize > 0: scheduler.step()
@@ -202,7 +198,7 @@ def main():
     train_time = str(datetime.timedelta(seconds=train_time))
     print("Finished. Total elapsed time (h:m:s): {}. Training time (h:m:s): {}.".format(elapsed, train_time))
 
-def train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, use_gpu):
+def train(epoch, model, criterion_xent, criterion_cent, optimizer_model, optimizer_cent, trainloader, use_gpu):
     model.train()
     losses = AverageMeter()
 
@@ -210,26 +206,17 @@ def train(epoch, model, criterion_xent, criterion_htri, optimizer, trainloader, 
         if use_gpu:
             imgs, pids = imgs.cuda(), pids.cuda()
         outputs, features = model(imgs)
-        if args.htri_only:
-            if isinstance(features, tuple):
-                loss = DeepSupervision(criterion_htri, features, pids)
-            else:
-                loss = criterion_htri(features, pids)
-        else:
-            if isinstance(outputs, tuple):
-                xent_loss = DeepSupervision(criterion_xent, outputs, pids)
-            else:
-                xent_loss = criterion_xent(outputs, pids)
-            
-            if isinstance(features, tuple):
-                htri_loss = DeepSupervision(criterion_htri, features, pids)
-            else:
-                htri_loss = criterion_htri(features, pids)
-            
-            loss = xent_loss + htri_loss
-        optimizer.zero_grad()
+        xentloss = criterion_xent(outputs, pids)
+        centloss = criterion_cent(features, pids) * args.weight_cent
+        loss = xentloss + centloss
+        optimizer_model.zero_grad()
+        optimizer_cent.zero_grad()
         loss.backward()
-        optimizer.step()
+        optimizer_model.step()
+        # remove the impact of weight_cent in learning centers
+        for param in criterion_cent.parameters():
+            param.grad.data *= (1. / args.weight_cent)
+        optimizer_cent.step()
         losses.update(loss.item(), pids.size(0))
 
         if (batch_idx+1) % args.print_freq == 0:
@@ -243,8 +230,7 @@ def test(model, queryloader, galleryloader, use_gpu, ranks=[1, 5, 10, 20]):
     with torch.no_grad():
         qf, q_pids, q_camids = [], [], []
         for batch_idx, (imgs, pids, camids) in enumerate(queryloader):
-            if use_gpu:
-                imgs = imgs.cuda()
+            if use_gpu: imgs = imgs.cuda()
             features = model(imgs)
             features = features.data.cpu()
             qf.append(features)
@@ -258,8 +244,7 @@ def test(model, queryloader, galleryloader, use_gpu, ranks=[1, 5, 10, 20]):
 
         gf, g_pids, g_camids = [], [], []
         for batch_idx, (imgs, pids, camids) in enumerate(galleryloader):
-            if use_gpu:
-                imgs = imgs.cuda()
+            if use_gpu: imgs = imgs.cuda()
             features = model(imgs)
             features = features.data.cpu()
             gf.append(features)

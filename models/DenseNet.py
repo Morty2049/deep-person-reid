@@ -3,7 +3,6 @@ from __future__ import absolute_import
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.autograd import Variable
 import torchvision
 
 __all__ = ['DenseNet121']
@@ -15,6 +14,7 @@ class DenseNet121(nn.Module):
         densenet121 = torchvision.models.densenet121(pretrained=True)
         self.base = densenet121.features
         self.classifier = nn.Linear(1024, num_classes)
+        self.feat_dim = 1024 # feature dimension
 
     def forward(self, x):
         x = self.base(x)
@@ -28,5 +28,9 @@ class DenseNet121(nn.Module):
             return y
         elif self.loss == {'xent', 'htri'}:
             return y, f
+        elif self.loss == {'cent'}:
+            return y, f
+        elif self.loss == {'ring'}:
+            return y, f
         else:
-            raise KeyError("Unknown loss: {}".format(self.loss))
+            raise KeyError("Unsupported loss: {}".format(self.loss))
